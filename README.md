@@ -37,4 +37,4 @@ The `messages.json` file should contain an array of strings:
 ]
 ```
 
-Messages will be sent in order, and the application will loop back to the beginning when all messages have been sent. 
+Messages will be sent in order, and the application will loop back to the beginning when all messages have been sent. # timemachine
