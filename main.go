@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -112,6 +114,8 @@ type Config struct {
 	Subject      string `json:"subject"`
 	MessagesFile string `json:"messages_file"`
 	CronSchedule string `json:"cron_schedule"`
+	AuthUsername string `json:"auth_username"`
+	AuthPassword string `json:"auth_password"`
 }
 
 func sendEmail(config Config, message string) error {
@@ -164,6 +168,238 @@ func processQueueMessage(config Config, queue *MessageQueue) {
 	}
 }
 
+const loginTemplate = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Time Machine - Login</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 400px;
+            margin: 100px auto;
+            padding: 0 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        input {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .error {
+            color: red;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Login</h1>
+        {{if .Error}}
+            <div class="error">{{.Error}}</div>
+        {{end}}
+        <form method="POST" action="/login">
+            <input type="text" name="username" placeholder="Username" required>
+            <input type="password" name="password" placeholder="Password" required>
+            <button type="submit">Login</button>
+        </form>
+    </div>
+</body>
+</html>
+`
+
+// Session management
+type SessionManager struct {
+	sessions map[string]time.Time
+	mu       sync.RWMutex
+}
+
+func NewSessionManager() *SessionManager {
+	sm := &SessionManager{
+		sessions: make(map[string]time.Time),
+	}
+	
+	// Start cleanup routine
+	go sm.cleanup()
+	
+	return sm
+}
+
+func (sm *SessionManager) cleanup() {
+	for {
+		time.Sleep(1 * time.Hour)
+		sm.mu.Lock()
+		now := time.Now()
+		for token, expires := range sm.sessions {
+			if now.After(expires) {
+				delete(sm.sessions, token)
+			}
+		}
+		sm.mu.Unlock()
+	}
+}
+
+func (sm *SessionManager) CreateSession() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	token := base64.URLEncoding.EncodeToString(b)
+	
+	sm.mu.Lock()
+	sm.sessions[token] = time.Now().Add(30 * 24 * time.Hour) // 30 days expiry
+	sm.mu.Unlock()
+	
+	return token
+}
+
+func (sm *SessionManager) ValidateSession(token string) bool {
+	sm.mu.RLock()
+	expires, exists := sm.sessions[token]
+	sm.mu.RUnlock()
+	
+	return exists && time.Now().Before(expires)
+}
+
+func (sm *SessionManager) RemoveSession(token string) {
+	sm.mu.Lock()
+	delete(sm.sessions, token)
+	sm.mu.Unlock()
+}
+
+func authMiddleware(next http.HandlerFunc, sm *SessionManager, config Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Check for session cookie
+		cookie, err := r.Cookie("session")
+		if err != nil || !sm.ValidateSession(cookie.Value) {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func startHTTPServer(queue *MessageQueue, config Config) {
+	sm := NewSessionManager()
+	mainTmpl := template.Must(template.New("index").Parse(htmlTemplate))
+	loginTmpl := template.Must(template.New("login").Parse(loginTemplate))
+
+	// Login handlers
+	http.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			username := r.FormValue("username")
+			password := r.FormValue("password")
+			
+			if username == config.AuthUsername && password == config.AuthPassword {
+				token := sm.CreateSession()
+				http.SetCookie(w, &http.Cookie{
+					Name:     "session",
+					Value:    token,
+					Path:     "/",
+					Expires:  time.Now().Add(30 * 24 * time.Hour),
+					HttpOnly: true,
+					SameSite: http.SameSiteStrictMode,
+				})
+				http.Redirect(w, r, "/", http.StatusSeeOther)
+				return
+			}
+			
+			loginTmpl.Execute(w, struct{ Error string }{Error: "Invalid credentials"})
+			return
+		}
+		
+		loginTmpl.Execute(w, nil)
+	})
+
+	// Logout handler
+	http.HandleFunc("/logout", func(w http.ResponseWriter, r *http.Request) {
+		if cookie, err := r.Cookie("session"); err == nil {
+			sm.RemoveSession(cookie.Value)
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "session",
+			Value:    "",
+			Path:     "/",
+			Expires:  time.Now().Add(-1 * time.Hour),
+			HttpOnly: true,
+		})
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	})
+
+	// Protected handlers
+	indexHandler := func(w http.ResponseWriter, r *http.Request) {
+		data := PageData{
+			Messages: queue.GetAll(),
+		}
+		mainTmpl.Execute(w, data)
+	}
+
+	addHandler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
+
+		message := r.FormValue("message")
+		if message == "" {
+			data := PageData{
+				Messages: queue.GetAll(),
+				Error:    "Message cannot be empty",
+			}
+			mainTmpl.Execute(w, data)
+			return
+		}
+
+		err := queue.Add(message)
+		if err != nil {
+			data := PageData{
+				Messages: queue.GetAll(),
+				Error:    fmt.Sprintf("Failed to add message: %v", err),
+			}
+			mainTmpl.Execute(w, data)
+			return
+		}
+
+		data := PageData{
+			Messages: queue.GetAll(),
+			Success:  true,
+		}
+		mainTmpl.Execute(w, data)
+	}
+
+	// Apply authentication to handlers
+	http.HandleFunc("/", authMiddleware(indexHandler, sm, config))
+	http.HandleFunc("/add", authMiddleware(addHandler, sm, config))
+
+	// Start HTTP server on port 8080
+	go func() {
+		log.Printf("Starting HTTP server on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+}
+
 func loadConfig() (Config, error) {
 	// Load .env file
 	if err := godotenv.Load(); err != nil {
@@ -179,6 +415,8 @@ func loadConfig() (Config, error) {
 		Subject:      os.Getenv("EMAIL_SUBJECT"),
 		MessagesFile: os.Getenv("MESSAGES_FILE"),
 		CronSchedule: os.Getenv("CRON_SCHEDULE"),
+		AuthUsername: os.Getenv("AUTH_USERNAME"),
+		AuthPassword: os.Getenv("AUTH_PASSWORD"),
 	}
 
 	// Validate required fields
@@ -193,6 +431,12 @@ func loadConfig() (Config, error) {
 	}
 	if config.ToEmail == "" {
 		return config, fmt.Errorf("TO_EMAIL is required")
+	}
+	if config.AuthUsername == "" {
+		return config, fmt.Errorf("AUTH_USERNAME is required")
+	}
+	if config.AuthPassword == "" {
+		return config, fmt.Errorf("AUTH_PASSWORD is required")
 	}
 
 	// Set defaults if not provided
@@ -227,6 +471,21 @@ const htmlTemplate = `
             padding: 20px;
             border-radius: 5px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            position: relative;
+        }
+        .logout {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            text-decoration: none;
+            padding: 8px 16px;
+            background-color: #dc3545;
+            color: white;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .logout:hover {
+            background-color: #c82333;
         }
         form {
             display: flex;
@@ -271,6 +530,7 @@ const htmlTemplate = `
 </head>
 <body>
     <div class="container">
+        <a href="/logout" class="logout">Logout</a>
         <h1>Add New Message to Queue</h1>
         {{if .Success}}
             <div class="success">Message added successfully!</div>
@@ -300,58 +560,6 @@ type PageData struct {
 	Error    string
 }
 
-func startHTTPServer(queue *MessageQueue) {
-	tmpl := template.Must(template.New("index").Parse(htmlTemplate))
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		data := PageData{
-			Messages: queue.GetAll(),
-		}
-		tmpl.Execute(w, data)
-	})
-
-	http.HandleFunc("/add", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Redirect(w, r, "/", http.StatusSeeOther)
-			return
-		}
-
-		message := r.FormValue("message")
-		if message == "" {
-			data := PageData{
-				Messages: queue.GetAll(),
-				Error:    "Message cannot be empty",
-			}
-			tmpl.Execute(w, data)
-			return
-		}
-
-		err := queue.Add(message)
-		if err != nil {
-			data := PageData{
-				Messages: queue.GetAll(),
-				Error:    fmt.Sprintf("Failed to add message: %v", err),
-			}
-			tmpl.Execute(w, data)
-			return
-		}
-
-		data := PageData{
-			Messages: queue.GetAll(),
-			Success:  true,
-		}
-		tmpl.Execute(w, data)
-	})
-
-	// Start HTTP server on port 8080
-	go func() {
-		log.Printf("Starting HTTP server on :8080")
-		if err := http.ListenAndServe(":8080", nil); err != nil {
-			log.Printf("HTTP server error: %v", err)
-		}
-	}()
-}
-
 func main() {
 	// Load configuration
 	config, err := loadConfig()
@@ -374,8 +582,8 @@ func main() {
 	}
 	log.Printf("Message queue initialized with %d messages", len(queue.Messages))
 
-	// Start HTTP server
-	startHTTPServer(queue)
+	// Start HTTP server with authentication
+	startHTTPServer(queue, config)
 
 	// Send first message immediately
 	log.Println("Sending first message immediately...")

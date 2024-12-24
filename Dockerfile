@@ -1,4 +1,4 @@
-FROM golang:1.21-alpine AS builder
+FROM golang:1.21.5-alpine AS builder
 
 WORKDIR /app
 
@@ -19,8 +19,8 @@ FROM alpine:latest
 
 WORKDIR /app
 
-# Copy timezone data
-COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+# Install timezone data
+RUN apk add --no-cache tzdata
 
 # Copy the binary from builder
 COPY --from=builder /app/timemachine .
