@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"log"
+	"net/http"
 	"net/smtp"
 	"os"
 	"sync"
@@ -89,6 +91,16 @@ func (q *MessageQueue) IsEmpty() bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.Messages) == 0
+}
+
+func (q *MessageQueue) GetAll() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	
+	// Return a copy to prevent external modifications
+	messages := make([]string, len(q.Messages))
+	copy(messages, q.Messages)
+	return messages
 }
 
 type Config struct {
@@ -197,6 +209,149 @@ func loadConfig() (Config, error) {
 	return config, nil
 }
 
+const htmlTemplate = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Time Machine - Add Message</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 0 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        textarea {
+            width: 100%;
+            height: 100px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            resize: vertical;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .messages {
+            margin-top: 20px;
+        }
+        .message {
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+        }
+        .success {
+            color: green;
+            margin-bottom: 10px;
+        }
+        .error {
+            color: red;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Add New Message to Queue</h1>
+        {{if .Success}}
+            <div class="success">Message added successfully!</div>
+        {{end}}
+        {{if .Error}}
+            <div class="error">{{.Error}}</div>
+        {{end}}
+        <form method="POST" action="/add">
+            <textarea name="message" placeholder="Enter your message here..." required></textarea>
+            <button type="submit">Add to Queue</button>
+        </form>
+        
+        <div class="messages">
+            <h2>Current Queue ({{len .Messages}} messages)</h2>
+            {{range .Messages}}
+                <div class="message">{{.}}</div>
+            {{end}}
+        </div>
+    </div>
+</body>
+</html>
+`
+
+type PageData struct {
+	Messages []string
+	Success  bool
+	Error    string
+}
+
+func startHTTPServer(queue *MessageQueue) {
+	tmpl := template.Must(template.New("index").Parse(htmlTemplate))
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		data := PageData{
+			Messages: queue.GetAll(),
+		}
+		tmpl.Execute(w, data)
+	})
+
+	http.HandleFunc("/add", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
+
+		message := r.FormValue("message")
+		if message == "" {
+			data := PageData{
+				Messages: queue.GetAll(),
+				Error:    "Message cannot be empty",
+			}
+			tmpl.Execute(w, data)
+			return
+		}
+
+		err := queue.Add(message)
+		if err != nil {
+			data := PageData{
+				Messages: queue.GetAll(),
+				Error:    fmt.Sprintf("Failed to add message: %v", err),
+			}
+			tmpl.Execute(w, data)
+			return
+		}
+
+		data := PageData{
+			Messages: queue.GetAll(),
+			Success:  true,
+		}
+		tmpl.Execute(w, data)
+	})
+
+	// Start HTTP server on port 8080
+	go func() {
+		log.Printf("Starting HTTP server on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+}
+
 func main() {
 	// Load configuration
 	config, err := loadConfig()
@@ -218,6 +373,9 @@ func main() {
 		log.Fatalf("Failed to initialize message queue: %v", err)
 	}
 	log.Printf("Message queue initialized with %d messages", len(queue.Messages))
+
+	// Start HTTP server
+	startHTTPServer(queue)
 
 	// Send first message immediately
 	log.Println("Sending first message immediately...")

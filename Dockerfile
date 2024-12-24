@@ -30,5 +30,8 @@ COPY --from=builder /app/messages.json .
 # Set timezone
 ENV TZ=Asia/Muscat
 
+# Expose HTTP port
+EXPOSE 8080
+
 # Run the application
 CMD ["./timemachine"] 
